@@ -37,6 +37,7 @@ import qualified Hasql.Encoders as Encoders
 import Hasql.Session (Session)
 import qualified Hasql.Session as Session
 import Hasql.Statement (Statement (..))
+import Hasql.Statement (Statement, preparable, unpreparable)
 import System.Posix.Types (CPid)
 
 -- | Listen to a channel.
@@ -44,22 +45,22 @@ import System.Posix.Types (CPid)
 -- https://www.postgresql.org/docs/current/sql-listen.html
 listen :: Identifier -> Statement () ()
 listen (Identifier chan) =
-  Statement (builderToByteString sql) Encoders.noParams Decoders.noResult False
+  unpreparable sql Encoders.noParams Decoders.noResult
   where
-    sql :: ByteString.Builder
+    sql :: Text
     sql =
-      "LISTEN " <> ByteString.Builder.byteString chan
+      "LISTEN " <> chan
 
 -- | Stop listening to a channel.
 --
 -- https://www.postgresql.org/docs/current/sql-unlisten.html
 unlisten :: Identifier -> Statement () ()
 unlisten (Identifier chan) =
-  Statement (builderToByteString sql) Encoders.noParams Decoders.noResult False
+  unpreparable sql Encoders.noParams Decoders.noResult
   where
-    sql :: ByteString.Builder
+    sql :: Text
     sql =
-      "UNLISTEN " <> ByteString.Builder.byteString chan
+      "UNLISTEN " <> chan
 
 -- | Stop listening to all channels.
 --
@@ -70,7 +71,7 @@ unlistenAll =
 
 -- | A Postgres identifier.
 newtype Identifier
-  = Identifier ByteString
+  = Identifier Text
   deriving newtype (Eq, Ord, Show)
 
 -- | Escape a string as a Postgres identifier.
@@ -167,9 +168,9 @@ data Notify = Notify
 -- https://www.postgresql.org/docs/current/sql-notify.html
 notify :: Statement Notify ()
 notify =
-  Statement sql encoder Decoders.noResult True
+  preparable sql encoder Decoders.noResult
   where
-    sql :: ByteString
+    sql :: Text
     sql =
       "SELECT pg_notify($1, $2)"
 
