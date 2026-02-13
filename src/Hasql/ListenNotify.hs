@@ -17,26 +17,20 @@ module Hasql.ListenNotify
   )
 where
 
-import Control.Exception (throwIO, try)
-import Control.Monad.Except (throwError)
+import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Control.Monad.IO.Class
-import Control.Monad.Reader (ask)
-import Data.ByteString (ByteString)
-import qualified Data.ByteString.Builder as ByteString (Builder)
-import qualified Data.ByteString.Builder as ByteString.Builder
-import qualified Data.ByteString.Lazy as ByteString.Lazy
 import Data.Functor.Contravariant ((>$<))
 import Data.Text (Text)
+import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Database.PostgreSQL.LibPQ as LibPQ
 import GHC.Conc.IO (threadWaitRead)
 import GHC.Generics (Generic)
-import qualified Hasql.Connection as Connection
 import qualified Hasql.Decoders as Decoders
 import qualified Hasql.Encoders as Encoders
+import qualified Hasql.Errors as HasqlErr
 import Hasql.Session (Session)
 import qualified Hasql.Session as Session
-import Hasql.Statement (Statement (..))
 import Hasql.Statement (Statement, preparable, unpreparable)
 import System.Posix.Types (CPid)
 
@@ -67,7 +61,7 @@ unlisten (Identifier chan) =
 -- https://www.postgresql.org/docs/current/sql-unlisten.html
 unlistenAll :: Statement () ()
 unlistenAll =
-  Statement "UNLISTEN *" Encoders.noParams Decoders.noResult False
+  unpreparable "UNLISTEN *" Encoders.noParams Decoders.noResult
 
 -- | A Postgres identifier.
 newtype Identifier
@@ -80,15 +74,15 @@ newtype Identifier
 -- https://www.postgresql.org/docs/15/libpq-exec.html
 escapeIdentifier :: Text -> Session Identifier
 escapeIdentifier text = do
-  libpq (\conn -> try (escapeIdentifier_ conn text)) >>= \case
+  libpq (\conn -> runExceptT (escapeIdentifier_ conn text)) >>= \case
     Left err -> throwError err
     Right identifier -> pure (Identifier identifier)
 
-escapeIdentifier_ :: LibPQ.Connection -> Text -> IO ByteString
+escapeIdentifier_ :: LibPQ.Connection -> Text -> ExceptT HasqlErr.SessionError IO Text
 escapeIdentifier_ conn text =
-  LibPQ.escapeIdentifier conn (Text.encodeUtf8 text) >>= \case
+  liftIO (LibPQ.escapeIdentifier conn (Text.encodeUtf8 text)) >>= \case
     Nothing -> throwQueryError conn "PQescapeIdentifier()" [text]
-    Just identifier -> pure identifier
+    Just identifier -> pure (Text.decodeUtf8 identifier)
 
 -- | An incoming notification.
 data Notification = Notification
@@ -103,27 +97,27 @@ data Notification = Notification
 -- https://www.postgresql.org/docs/current/libpq-notify.html
 await :: Session Notification
 await =
-  libpq (\conn -> try (await_ conn)) >>= \case
+  libpq (\conn -> runExceptT (await_ conn)) >>= \case
     Left err -> throwError err
     Right notification -> pure (parseNotification notification)
 
-await_ :: LibPQ.Connection -> IO LibPQ.Notify
+await_ :: LibPQ.Connection -> ExceptT HasqlErr.SessionError IO LibPQ.Notify
 await_ conn =
   pollForNotification
   where
-    pollForNotification :: IO LibPQ.Notify
+    pollForNotification :: ExceptT HasqlErr.SessionError IO LibPQ.Notify
     pollForNotification =
       poll_ conn >>= \case
         -- Block until a notification arrives. Snag: the connection might be closed (what). If so, attempt to reset it
         -- and poll for a notification on the new connection.
         Nothing ->
-          LibPQ.socket conn >>= \case
+          liftIO (LibPQ.socket conn) >>= \case
             -- "No connection is currently open"
             Nothing -> do
               pqReset conn
               pollForNotification
             Just socket -> do
-              threadWaitRead socket
+              liftIO $ threadWaitRead socket
               -- Data has appeared on the socket, but libPQ won't buffer it for us unless we do something (PQexec, etc).
               -- PQconsumeInput is provided for when we don't have anything to do except populate the notification
               -- buffer.
@@ -134,18 +128,18 @@ await_ conn =
 -- | Variant of 'await' that doesn't block.
 poll :: Session (Maybe Notification)
 poll =
-  libpq (\conn -> try (poll_ conn)) >>= \case
+  libpq (\conn -> runExceptT (poll_ conn)) >>= \case
     Left err -> throwError err
     Right maybeNotification -> pure (parseNotification <$> maybeNotification)
 
 -- First call `notifies` to pop a notification off of the buffer, if there is one. If there isn't, try `consumeInput` to
 -- populate the buffer, followed by another followed by another `notifies`.
-poll_ :: LibPQ.Connection -> IO (Maybe LibPQ.Notify)
+poll_ :: LibPQ.Connection -> ExceptT HasqlErr.SessionError IO (Maybe LibPQ.Notify)
 poll_ conn =
-  LibPQ.notifies conn >>= \case
+  liftIO (LibPQ.notifies conn) >>= \case
     Nothing -> do
       pqConsumeInput conn
-      LibPQ.notifies conn
+      liftIO $ LibPQ.notifies conn
     notification -> pure notification
 
 -- | Get the PID of the backend process handling this session. This can be used to filter out notifications that
@@ -182,36 +176,30 @@ notify =
 ------------------------------------------------------------------------------------------------------------------------
 -- Little wrappers that throw
 
-pqConsumeInput :: LibPQ.Connection -> IO ()
+pqConsumeInput :: LibPQ.Connection -> ExceptT HasqlErr.SessionError IO ()
 pqConsumeInput conn =
-  LibPQ.consumeInput conn >>= \case
+  liftIO (LibPQ.consumeInput conn) >>= \case
     False -> throwQueryError conn "PQconsumeInput()" []
     True -> pure ()
 
-pqReset :: LibPQ.Connection -> IO ()
+pqReset :: LibPQ.Connection -> ExceptT HasqlErr.SessionError IO ()
 pqReset conn = do
-  LibPQ.reset conn
-  LibPQ.status conn >>= \case
+  liftIO $ LibPQ.reset conn
+  liftIO (LibPQ.status conn) >>= \case
     LibPQ.ConnectionOk -> throwQueryError conn "PQreset()" []
     _ -> pure ()
 
 -- Throws a QueryError
-throwQueryError :: LibPQ.Connection -> ByteString -> [Text] -> IO void
+throwQueryError :: LibPQ.Connection -> Text -> [Text] -> ExceptT HasqlErr.SessionError IO void
 throwQueryError conn context params = do
-  message <- LibPQ.errorMessage conn
-  throwIO (Session.QueryError context params (Session.ClientError message))
-
---
+  message <- fmap Text.decodeUtf8 <$> liftIO (LibPQ.errorMessage conn)
+  throwError (HasqlErr.DriverSessionError ("hasql-listen-notify:error:" <> context <> ": " <> Text.pack (show params) <> (maybe "" (" : " <>) message)))
 
 libpq :: (LibPQ.Connection -> IO a) -> Session a
 libpq action = do
-  conn <- ask
-  liftIO (Connection.withLibPQConnection conn action)
-
-builderToByteString :: ByteString.Builder -> ByteString
-builderToByteString =
-  ByteString.Lazy.toStrict . ByteString.Builder.toLazyByteString
-{-# INLINE builderToByteString #-}
+  Session.onLibpqConnection \libpqConn -> do
+    a <- liftIO $ action libpqConn
+    pure $ (Right a, libpqConn)
 
 -- Parse a Notify from a LibPQ.Notify
 parseNotification :: LibPQ.Notify -> Notification
